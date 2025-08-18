@@ -1,0 +1,11 @@
+Miniconda3-*.sh
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.zip
+*.tar.gz
+*.7z
+*.mp4
+*.mov
+*.wav
