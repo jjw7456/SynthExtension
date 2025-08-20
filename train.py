@@ -114,7 +114,7 @@ def train():
     world_size = get_world_size()
     device = torch.device(f"cuda:{rank}")
 
-    cfg = OmegaConf.load("default.yaml")
+    cfg = OmegaConf.load("config.yaml")
     if rank == 0:
         print(f"Using DDP on {world_size} GPUs. Rank {rank} on device {device}.")
 
@@ -192,18 +192,26 @@ def train():
         use_cross_attn=cfg.model.use_cross_attn,
         n_self_attn=cfg.model.n_self_attn,
         n_cross_attn=cfg.model.n_cross_attn,
-        filter_activation=cfg.filter.activation,
+
         enable_inject=cfg.model.enable_inject,
+        inject_mode = cfg.model.inject_mode,
         inject_f0_hz=cfg.model.inject_f0_hz,
         inject_sigma_hz=cfg.model.inject_sigma_hz,
         smooth_gate_kernel=cfg.model.smooth_gate_kernel,
-        # ----- FiLM -----
+
+        filter_activation=cfg.model.filter_activation,
+
         cond_dim=cfg.model.cond_dim,
+
         use_film=cfg.model.use_film,
         film_on_tgt=cfg.model.film_on_tgt,
         film_hidden=cfg.model.film_hidden,
         film_dropout=cfg.model.film_dropout,
-        film_layernorm=cfg.model.film_layernorm
+        film_layernorm=cfg.model.film_layernorm,
+
+        use_filt_head=cfg.model.use_filt_head,
+
+        alt_permute=cfg.model.alt_permute,
     ).to(device)
 
     model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=False)
