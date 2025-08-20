@@ -6,6 +6,7 @@ import torch.nn.functional as F  # <-- NEW
 import torchaudio
 import soundfile as sf
 from omegaconf import OmegaConf
+from collections import defaultdict
 
 # SynthExtension imports only (충돌 없음)
 from model import AudioFilterModel
@@ -28,13 +29,11 @@ def save_wav(path, x, sr):
     sf.write(path, x, samplerate=int(sr))
 
 @torch.no_grad()
-def stft_mag_phase(wave, n_fft, hop, win, use_log_mag, device):
+def stft_mag_phase(wave, n_fft, hop, win, device):
     win_t = torch.hann_window(win, device=device)
     spec = torch.stft(wave, n_fft=n_fft, hop_length=hop, win_length=win,
                       return_complex=True, window=win_t, center=True)
     mag = spec.abs()
-    if use_log_mag:
-        mag = torch.log1p(mag)
     phase = spec.angle()
     return mag, phase
 
@@ -105,12 +104,12 @@ def build_uid_to_cond_from_dataset(cfg, device, cond_dim=None, split="valid"):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--long_dir", type=str, required=True, help="folder containing *_long.wav and *_gt.wav")
-    ap.add_argument("--ext_cfg", type=str, required=True)
+    ap.add_argument("--ext_cfg", type=str, default='config_inference.yaml')
     ap.add_argument("--epoch", type=int, default=None)
     ap.add_argument("--tag", type=str, default=None)
     ap.add_argument("--device", type=str, default="cuda", choices=["cuda","cpu"])
     ap.add_argument("--outdir", type=str, default="./out_from_long")
-    ap.add_argument("--on_sec", type=float, default=6.0, help="note-on seconds in *_long.wav (mask)")
+    ap.add_argument("--on_sec", type=float, default=1.5, help="note-on seconds in *_long.wav (mask)")
     ap.add_argument("--cond_source", type=str, default="none", choices=["none","pickle","dataset"])
     ap.add_argument("--cond_pickle", type=str, default=None, help="predicted_params.pickle path (if cond_source=pickle)")
     ap.add_argument("--split", type=str, default="valid", choices=["valid","train"], help="dataset split for cond_source=dataset")
@@ -141,17 +140,28 @@ def main():
         attn_heads=cfg.model.attn_heads,
         use_self_attn=cfg.model.use_self_attn,
         use_cross_attn=cfg.model.use_cross_attn,
-        filter_activation=cfg.filter.activation,
+        n_self_attn=cfg.model.n_self_attn,
+        n_cross_attn=cfg.model.n_cross_attn,
+
         enable_inject=cfg.model.enable_inject,
+        inject_mode = cfg.model.inject_mode,
         inject_f0_hz=cfg.model.inject_f0_hz,
         inject_sigma_hz=cfg.model.inject_sigma_hz,
         smooth_gate_kernel=cfg.model.smooth_gate_kernel,
+
+        filter_activation=cfg.model.filter_activation,
+
         cond_dim=cfg.model.cond_dim,
+
         use_film=cfg.model.use_film,
         film_on_tgt=cfg.model.film_on_tgt,
         film_hidden=cfg.model.film_hidden,
         film_dropout=cfg.model.film_dropout,
-        film_layernorm=cfg.model.film_layernorm
+        film_layernorm=cfg.model.film_layernorm,
+
+        use_filt_head=cfg.model.use_filt_head,
+
+        alt_permute=cfg.model.alt_permute,
     ).to(device)
 
     class _DPCompat(torch.nn.Module):
@@ -185,6 +195,7 @@ def main():
         return
 
     total_ms, count = 0.0, 0
+    meter = defaultdict(float); n=0
     for fname in files:
         uid = re.sub(r"_long\.wav$", "", fname)
         src_path = os.path.join(args.long_dir, fname)
@@ -208,8 +219,8 @@ def main():
                 tgt = tgt[..., :src.size(-1)]
 
         # features (STFT)
-        src_mag, src_phase = stft_mag_phase(src, n_fft, hop, win, use_log_mag, device)
-        tgt_mag, _        = stft_mag_phase(tgt, n_fft, hop, win, use_log_mag, device)
+        src_mag, src_phase = stft_mag_phase(src, n_fft, hop, win, device)
+        tgt_mag, _        = stft_mag_phase(tgt, n_fft, hop, win, device)
 
         # ---- NEW: if STFT frames still differ, align T by pad/crop on tgt_mag ----
         Tsrc = src_mag.shape[-1]
@@ -236,13 +247,15 @@ def main():
 
         # forward (single pass)
         t0 = time.perf_counter()
-        pred = model(
+        pred, dbg = model(
             src_mag=src_mag,
             src_phase=src_phase,
             tgt_mag=tgt_mag,
             src_audio_length=src.shape[-1],
             note_on_mask=note_on,
-            cond=cond
+            cond=cond,
+            tgt_audio=tgt,
+            collect_metrics=True
         )  # [1, Tsrc]
         if device.type == "cuda":
             torch.cuda.synchronize()
@@ -260,6 +273,11 @@ def main():
 
         print(f"[{uid}] time={ms:.2f} ms | src_len={src.shape[-1]/sr:.2f}s | tgt_len={tgt.shape[-1]/sr:.2f}s")
 
+        for k,v in dbg.items():
+            if isinstance(v,(int,float)) and v is not None:
+                meter[k]+=float(v)
+        n+=1
+
     if count > 0:
         print(f"\n✅ Done {count} items | avg_time={total_ms/count:.2f} ms | out → {args.outdir}")
 
@@ -269,5 +287,10 @@ def main():
         for kind in ("self", "cross"):
             for _, i, mean_a2, s, c in stats.get(kind, []):
                 print(f"{kind}[{i}]  mean_sum_alpha2 = {mean_a2:.6f}  (sum={s:.4f}, cnt={c:.1f})")
+    
+    print("=== Averages ===")
+    for k,v in meter.items():
+        print(f"{k}: {v/n:.6f}")
+
 if __name__ == "__main__":
     main()

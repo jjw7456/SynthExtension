@@ -1,0 +1,81 @@
+dataset:
+  root_dirs:
+    - /dataset/swc/stage3/seed1/dexed/599epoch/audio_train
+    - /dataset/swc/stage3/seed1/surge/599epoch/audio_train
+  valid_root_dirs:
+    - /dataset/swc/stage3/seed1/dexed/599epoch/audio_valid
+    - /dataset/swc/stage3/seed1/surge/599epoch/audio_valid
+  test_root_dirs:
+    - /dataset/swc/stage3/seed1/dexed/599epoch/audio_test
+    - /dataset/swc/stage3/seed1/surge/599epoch/audio_test
+  sample_rate: 22050
+  segment_seconds: 4.0
+  audio_extension: .wav
+  use_precomputed: true
+  cache_subdir: specs
+
+  n_fft: 1024
+  hop_length: 256
+  win_length: 1024
+  n_mel_bins: 128
+  use_mel: true
+  window: hann
+  use_log_mag: true
+  normalize_mag: false
+  
+
+model:
+  embed_dim: 256
+  cnn_layers: 4
+  attn_heads: 4
+  use_self_attn: true
+  use_cross_attn: true
+  n_self_attn: 6
+  n_cross_attn: 6
+
+  enable_inject: True
+  inject_mode: saw
+  inject_f0_hz: 130.8128
+  inject_sigma_hz: 40.0
+  smooth_gate_kernel: 3
+
+  use_film: False
+  film_on_tgt: False
+  film_hidden: 512
+  film_dropout: 0.0
+  film_layernorm: True
+  cond_dim: 2824
+
+  use_filt_head: false
+
+  alt_permute: True
+
+  use_hifigan: false
+
+  filter_activation: relu
+
+training:
+  batch_size: 16
+  learning_rate: 0.0003
+  optimizer: adam
+  num_epochs: 500
+  scheduler: cosine
+  grad_clip: 1.0 
+  resume: false
+  resume_tag: null
+
+loss:
+  type: mrstft                # Type: mrstft | l1 | l2 | combo
+  fft_sizes: [512, 1024, 2048]
+  hop_sizes: [128, 256, 512]
+  win_lengths: [512, 1024, 2048]
+  mag_weight: 1.0
+  sc_weight: 1.0              # Spectral convergence weight
+  use_log_mag: true
+
+log:
+  log_interval: 10
+  save_interval: 1000
+  use_wandb: false
+  ckpt_dir: /dataset/synth_extension/logs/checkpoints_with_saw_alt_permute_250820
+  log_dir: /dataset/synth_extension/logs/tensorboard

@@ -21,8 +21,7 @@ dataset:
   use_mel: true
   window: hann
   use_log_mag: true
-  normalize_mag: true
-
+  normalize_mag: false
   
 
 model:
@@ -35,21 +34,25 @@ model:
   n_cross_attn: 6
 
   enable_inject: True
-  inject_mode: saw
+  inject_mode: constant
   inject_f0_hz: 130.8128
   inject_sigma_hz: 40.0
   smooth_gate_kernel: 3
 
-  cond_dim: 2824
   use_film: False
   film_on_tgt: False
   film_hidden: 512
   film_dropout: 0.0
   film_layernorm: True
+  cond_dim: 2824
 
-filter:
-  mode: magnitude_only
-  activation: relu
+  use_filt_head: false
+
+  alt_permute: True
+
+  use_hifigan: false
+
+  filter_activation: relu
 
 training:
   batch_size: 16
@@ -74,5 +77,5 @@ log:
   log_interval: 10
   save_interval: 1000
   use_wandb: false
-  ckpt_dir: /dataset/synth_extension/logs/checkpoints_with_saw_250818
+  ckpt_dir: /dataset/synth_extension/logs/checkpoints_with_const_alt_permute_250820
   log_dir: /dataset/synth_extension/logs/tensorboard

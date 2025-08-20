@@ -5,6 +5,7 @@ import soundfile as sf
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from omegaconf import OmegaConf
+from collections import defaultdict
 
 from data import SpectrogramFilterDataset
 from model import AudioFilterModel
@@ -83,6 +84,8 @@ def run_inference_on_indices(model, dataset, indices, device, outdir, sr, cond_d
     local_time_sum = 0.0
     local_count = 0
 
+    meter = defaultdict(float); n=0
+
     for idx in indices:
         sample = dataset[idx]
 
@@ -129,13 +132,15 @@ def run_inference_on_indices(model, dataset, indices, device, outdir, sr, cond_d
 
         # ---- forward & timing ----
         t0 = time.perf_counter()
-        pred_audio = model(
+        pred_audio, dbg = model(
             src_mag=src_mag,
             src_phase=src_phase,
             tgt_mag=tgt_mag,
             src_audio_length=src_audio.shape[-1],
             note_on_mask=note_on_mask,
-            cond=cond
+            cond=cond,
+            tgt_audio=tgt_audio,
+            collect_metrics=True
         )  # [1,T]
         torch.cuda.synchronize(device) if device.type == "cuda" else None
         dt = (time.perf_counter() - t0) * 1000.0  # ms
@@ -160,6 +165,17 @@ def run_inference_on_indices(model, dataset, indices, device, outdir, sr, cond_d
         local_time_sum += dt
         local_count += 1
 
+        # 루프 안에서
+        for k,v in dbg.items():
+            if isinstance(v,(int,float)) and v is not None:
+                meter[k]+=float(v)
+        n+=1
+
+    # 루프 끝
+    print("=== Averages ===")
+    for k,v in meter.items():
+        print(f"{k}: {v/n:.6f}")
+
     return local_time_sum, local_count
 
 
@@ -183,7 +199,7 @@ def main(n_samples=5, epoch=None, tag=None, outdir="inference_valid_samples",
     device = torch.device(f"cuda:{get_rank()}" if use_cuda else "cpu")
 
     # --- cfg / dataset ---
-    cfg = OmegaConf.load("default2.yaml")
+    cfg = OmegaConf.load(args.ext_cfg)
     sr = int(cfg.dataset.sample_rate)
 
     valid_root_dirs = cfg.dataset.valid_root_dirs if "valid_root_dirs" in cfg.dataset else cfg.dataset.root_dirs
@@ -227,19 +243,28 @@ def main(n_samples=5, epoch=None, tag=None, outdir="inference_valid_samples",
         attn_heads=cfg.model.attn_heads,
         use_self_attn=cfg.model.use_self_attn,
         use_cross_attn=cfg.model.use_cross_attn,
-        filter_activation=cfg.filter.activation,
-        # Saw injection
+        n_self_attn=cfg.model.n_self_attn,
+        n_cross_attn=cfg.model.n_cross_attn,
+
         enable_inject=cfg.model.enable_inject,
+        inject_mode = cfg.model.inject_mode,
         inject_f0_hz=cfg.model.inject_f0_hz,
         inject_sigma_hz=cfg.model.inject_sigma_hz,
         smooth_gate_kernel=cfg.model.smooth_gate_kernel,
-        # FiLM
+
+        filter_activation=cfg.model.filter_activation,
+
         cond_dim=cfg.model.cond_dim,
+
         use_film=cfg.model.use_film,
         film_on_tgt=cfg.model.film_on_tgt,
         film_hidden=cfg.model.film_hidden,
         film_dropout=cfg.model.film_dropout,
-        film_layernorm=cfg.model.film_layernorm
+        film_layernorm=cfg.model.film_layernorm,
+
+        use_filt_head=cfg.model.use_filt_head,
+
+        alt_permute=cfg.model.alt_permute
     ).to(device)
 
     if is_dist_ready():
@@ -317,6 +342,7 @@ if __name__ == "__main__":
                         help="If set, log only self-attention (ignore cross).")
     parser.add_argument("--log_cross_only", action="store_true",
                         help="If set, log only cross-attention (ignore self).")
+    parser.add_argument("--ext_cfg", type=str, default="config_inference.yaml")
 
     args = parser.parse_args()
 

@@ -81,6 +81,9 @@ class CNNEncoder(nn.Module):
         self.cnn = nn.Sequential(*layers)
 
     def forward(self, x):
+
+        # DEPRECATED
+
         """
         Args:
             x: Tensor of shape [B, 1, F, T]
@@ -90,7 +93,10 @@ class CNNEncoder(nn.Module):
         """
         x = self.cnn(x)  # [B, D, F', T']
         B, D, Fp, Tp = x.shape
+
         x = x.permute(0, 2, 3, 1).reshape(B, Fp * Tp, D)
+
+        print("[WARNING] THIS METHOD IS DEPRECATED.")
         return x, (Fp, Tp)
 
 
@@ -158,11 +164,9 @@ class CrossAttentionBlock(nn.Module):
         x = self.norm2(x + ffn_out)
         return x
 
-
-
 # --- Audio Filter Encoder (CNN + 2D Positional Encoding + Self-Attn) ---
 class AudioFilterEncoder(nn.Module):
-    def __init__(self, embed_dim=256, cnn_layers=4, attn_heads=4, use_self_attn=True, n_self_attn=1):
+    def __init__(self, embed_dim=256, cnn_layers=4, attn_heads=4, use_self_attn=True, n_self_attn=1, alt_permute=False):
         """
         Combines CNN encoder with 2D positional encoding and optional self-attention.
         """
@@ -175,7 +179,7 @@ class AudioFilterEncoder(nn.Module):
             self.self_attn_blocks = nn.ModuleList(
                 [SelfAttentionBlock(embed_dim, n_heads=attn_heads) for _ in range(self.n_self_attn)]
             )
-
+        self.alt_permute = alt_permute
     def forward(self, x):
         """
         Args:
@@ -187,16 +191,48 @@ class AudioFilterEncoder(nn.Module):
         feat = self.encoder.cnn(x)                  # [B, D, H, W]
         feat = self.pos_enc2d(feat)                 # add 2D positional encoding
         B, D, H, W = feat.shape
-        x = feat.permute(0, 2, 3, 1).reshape(B, H * W, D)
+        if self.alt_permute:
+            x = feat.permute(0, 3, 2, 1).reshape(B, H * W, D)
+        else:
+            x = feat.permute(0, 2, 3, 1).reshape(B, H * W, D)
         if self.use_self_attn:
             for blk in self.self_attn_blocks:
                 x = blk(x)
         return x, (H, W)
 
+class HProjector(nn.Module):
+    def __init__(self, tie_across_F: bool = False, temp: float = 1.0):
+        super().__init__()
+        self.tie = bool(tie_across_F)
+        self.temp = float(temp)
+        self.register_parameter("w_logits", None)  # lazy param
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+    def _ensure_param(self, F, H, device, dtype):
+        want_shape = (H,) if self.tie else (F, H)
+        need_new = (
+            self.w_logits is None
+            or self.w_logits.shape != want_shape
+            or self.w_logits.device != device
+            or self.w_logits.dtype  != dtype
+        )
+        if need_new:
+            w = torch.zeros(want_shape, device=device, dtype=dtype)
+            self.w_logits = nn.Parameter(w)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, F, H, W]
+        B, F, H, W = x.shape
+        self._ensure_param(F, H, x.device, x.dtype)
+
+        if self.tie:
+            # w: [H] -> softmax over H
+            w = torch.softmax(self.w_logits / self.temp, dim=-1)          # [H]
+            y = torch.einsum('bfhw,h->bfw', x, w)                          # [B,F,W]
+        else:
+            # w: [F,H]
+            w = torch.softmax(self.w_logits / self.temp, dim=-1)           # [F,H]
+            y = torch.einsum('bfhw,fh->bfw', x, w)                         # [B,F,W]
+        return y
 
 class AudioFilterModel(nn.Module):
     def __init__(
@@ -227,7 +263,12 @@ class AudioFilterModel(nn.Module):
         film_hidden: int = 512,
         film_dropout: float = 0.0,
         film_layernorm: bool = True,
-        # ---- FiLM conditioning ----
+        
+        use_filt_head: bool = False,
+
+        alt_permute: bool = False,
+
+        use_hifigan: bool = False,
     ):
         super().__init__()
         self.n_fft = n_fft
@@ -243,8 +284,6 @@ class AudioFilterModel(nn.Module):
         self.inject_sigma_hz = float(inject_sigma_hz)
         self.smooth_gate_kernel = int(smooth_gate_kernel)
 
-        # ---- NEW ----
-        assert inject_mode in ("saw", "noise"), "inject_mode must be 'saw' or 'noise'"
         self.inject_mode = inject_mode
 
         # --- iSTFT window as buffer (DP-safe) ---
@@ -258,11 +297,16 @@ class AudioFilterModel(nn.Module):
         self.register_buffer("eps", torch.tensor(1e-8, dtype=torch.float32), persistent=False)
 
         # --- Encoder / Attention / Head ---
-        self.encoder = AudioFilterEncoder(embed_dim, cnn_layers, attn_heads, use_self_attn, n_self_attn)
+        self.encoder = AudioFilterEncoder(embed_dim, cnn_layers, attn_heads, use_self_attn, n_self_attn, alt_permute)
         if use_cross_attn:
             self.cross_attn_blocks = nn.ModuleList(
                 [CrossAttentionBlock(embed_dim, n_heads=attn_heads) for _ in range(self.n_cross_attn)]
             )
+
+        self.use_filt_head = use_filt_head
+        if use_filt_head:
+            self.hproj = HProjector(tie_across_F=False, temp=1.0)  # F별로 독립 가중치
+            
         self.to_filter = nn.Linear(embed_dim, n_fft // 2 + 1)
 
         # --- Injection (early) ---
@@ -284,6 +328,8 @@ class AudioFilterModel(nn.Module):
                 self.cond_ln = nn.LayerNorm(cond_dim)
             else:
                 self.cond_ln = None
+
+        self.use_hifigan = use_hifigan
 
 
     def set_alpha2_logging(self, enable: bool = True, self_attn: bool = True, cross_attn: bool = True):
@@ -369,6 +415,9 @@ class AudioFilterModel(nn.Module):
         gamma, beta = gb.chunk(2, dim=-1)             # [B, D], [B, D]
         feats = (1.0 + gamma.unsqueeze(1)) * feats + beta.unsqueeze(1)
         return feats
+    
+    def _rms(self, x: torch.Tensor, dim=None, keepdim=False):
+        return (x.pow(2).mean(dim=dim, keepdim=keepdim) + float(self.eps)).sqrt()
 
     # ---------- Forward ----------
     def forward(
@@ -379,7 +428,11 @@ class AudioFilterModel(nn.Module):
         src_audio_length: int = None,
         tgt_embed_cached: torch.Tensor = None,  # [B, L, D] (optional)
         note_on_mask: torch.Tensor = None,      # [B, T] in {0,1}
-        cond: torch.Tensor = None               # [B, P] (e.g., 2824)
+        cond: torch.Tensor = None,               # [B, P] (e.g., 2824)
+
+        collect_metrics: bool = False,
+        src_audio: torch.Tensor = None,         # [B,T] or [T] (optional, time-domain input for true RMS_in)
+        tgt_audio: torch.Tensor = None,
     ) -> torch.Tensor:
         B, Fbins, Tframes = src_mag.shape
         dtype = src_mag.dtype
@@ -408,10 +461,15 @@ class AudioFilterModel(nn.Module):
                     dtype=dtype
                 ).view(1, Fbins, 1)                                      # [1,F,1]
                 inject = T_f * gate_t                                    # [B,F,T]
-            else:  # "noise"
+            elif self.inject_mode == "noise":
                 N = self._noise_template(B, Fbins, Tframes, device, dtype)   # [B,F,T]
                 inject = N * gate_t                                          # [B,F,T]
+            elif self.inject_mode == "constant":
+                # MIDI on 구간(env==1)에서 모든 주파수에 동일한 상수(=alpha)를 더함
+                inject = gate_t                      # [B,F,T]
 
+            else:
+                raise ValueError(f"Unknown inject_mode: {self.inject_mode}")
             src_mag_in = src_mag + alpha * inject
         else:
             src_mag_in = src_mag
@@ -423,7 +481,7 @@ class AudioFilterModel(nn.Module):
             tgt_input = tgt_mag if tgt_mag is not None else src_mag_in
             tgt_embed, _ = self.encoder(tgt_input.unsqueeze(1))          # [B,L,D]
 
-        src_embed, _ = self.encoder(src_mag_in.unsqueeze(1))             # [B,L,D]
+        src_embed, (H,  W ) = self.encoder(src_mag_in.unsqueeze(1))             # [B,L,D]
 
         # ====== (1.5) FiLM (before cross-attn) ======
         if self.use_film:
@@ -438,11 +496,18 @@ class AudioFilterModel(nn.Module):
             features = src_embed
         features = src_embed  # [B,L,D]
 
-        # ====== (3) MASK PRED ======
-        filt = self.to_filter(features)                  # [B,L,F]
-        filt = filt.permute(0, 2, 1)                     # [B,F,L]
-        #filt = F.adaptive_avg_pool1d(filt, src_mag.shape[-1])  # [B, F, T]
-        filt = F.interpolate(filt, size=src_mag.shape[-1], mode="linear", align_corners=False)  # [B,F,T]
+        if self.use_filt_head:
+            features = features.view(B, H, W, -1)            # [B,H,W,D]
+            filt = self.to_filter(features)                  # [B,H,W,F]  (여기서 D->F 매핑은 네가 이미 구현)
+            filt = filt.permute(0, 3, 1, 2)                  # [B,F,H,W]
+            filt = self.hproj(filt)                          # [B,F,W]  ← do_something
+            filt = F.interpolate(filt, size=src_mag.shape[-1],
+                                mode="linear", align_corners=False)  # [B,F,T] 
+        else:
+            filt = self.to_filter(features)                  # [B,L,F]
+            filt = filt.permute(0, 2, 1)                     # [B,F,L]
+            #filt = F.adaptive_avg_pool1d(filt, src_mag.shape[-1])  # [B, F, T]
+            filt = F.interpolate(filt, size=src_mag.shape[-1], mode="linear", align_corners=False)  # [B,F,T]
 
         if self.filter_activation == "relu":
             filt = F.relu(filt)
@@ -450,10 +515,43 @@ class AudioFilterModel(nn.Module):
             filt = torch.sigmoid(filt)
         elif self.filter_activation == "tanh":
             filt = torch.tanh(filt)
-
-        # ====== (4) APPLY MASK ======
+    
         mag_filtered = src_mag_in * filt
 
+
+
+        dbg = None
+        if collect_metrics:
+            with torch.no_grad():
+                # on-마스크
+                if note_on_mask is not None:
+                    env = note_on_mask.view(src_mag.size(0), 1, src_mag.size(-1)).to(filt.dtype)  # [B,1,T]
+                else:
+                    env = torch.ones(src_mag.size(0), 1, src_mag.size(-1), device=filt.device, dtype=filt.dtype)
+
+                # 마스크 평균/에너지(on 구간)
+                filt_mean_on = ((filt * env).sum(dim=(1,2)) / (env.sum(dim=(1,2)) + self.eps)).mean()  # scalar
+                filt_ms_on   = (((filt ** 2) * env).sum(dim=(1,2)) / (env.sum(dim=(1,2)) + self.eps)).mean()
+
+                # 게이트 평균(on 구간) – enable_inject일 때만 의미 있음
+                gate_mean = None
+                try:
+                    gate_mean = ((gate_t * env).sum(dim=(1,2)) / (torch.full((env.shape[0],), float(env.shape[2]), device=env.device, dtype=env.dtype) + self.eps)).mean().item()
+                except NameError:
+                    pass
+
+                inject_alpha = torch.sigmoid(self.inject_alpha).item()
+
+                dbg = {
+                    "filt_mean_on": float(filt_mean_on.item()),
+                    "filt_mean_sq_on": float(filt_ms_on.item()),
+                    "gate_mean": gate_mean,
+                    "inject_alpha": inject_alpha,
+                }
+
+        if self.use_hifigan:
+            return mag_filtered
+        
         # ====== (5) PHASE + iSTFT ======
         real = mag_filtered * torch.cos(src_phase)
         imag = mag_filtered * torch.sin(src_phase)
@@ -466,4 +564,35 @@ class AudioFilterModel(nn.Module):
             length=src_audio_length,
             window=self.window.to(real.dtype)
         )
+
+        if collect_metrics:
+            with torch.no_grad():
+                # on 구간 샘플 수(대략): frames_on * hop
+                if note_on_mask is not None:
+                    frames_on = note_on_mask.sum(dim=-1).to(torch.float)  # [B]
+                    samps_on = (frames_on * self.hop).clamp(max=audio_out.shape[-1])
+                    samps_on = int(samps_on.mean().item())  # 배치 평균값 사용
+                else:
+                    samps_on = audio_out.shape[-1]
+
+                # 출력 RMS(on)
+                rms_out_on = self._rms(audio_out[..., :samps_on]).item()
+
+                # 입력 RMS(on): tgt_audio가 넘어오면 실제 time-domain 사용
+                rms_in_on = None
+                if tgt_audio is not None:
+                    x_time = tgt_audio
+                    if isinstance(x_time, torch.Tensor) and x_time.dim() == 2:
+                        x_time = x_time.mean(dim=0)  # [T]로 단순화(모노)
+                    rms_in_on = self._rms(x_time[..., :samps_on]).item()
+
+                dbg.update({
+                    "samps_on": int(samps_on),
+                    "rms_out_on": rms_out_on,
+                    "rms_in_on": rms_in_on,
+                    "rms_ratio": (rms_out_on / (rms_in_on + 1e-8)) if rms_in_on is not None else None,
+                })
+                
+        if collect_metrics:
+            return audio_out, dbg
         return audio_out
