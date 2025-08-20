@@ -1,4 +1,5 @@
-# inference_valid_ddp_samples.py
+# export PYTHONPATH=.
+
 import os, time, random
 import torch
 import soundfile as sf

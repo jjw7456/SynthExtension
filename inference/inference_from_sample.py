@@ -1,4 +1,5 @@
-# infer_from_rendered_longnotes.py
+# export PYTHONPATH=.
+
 import os, re, time, pickle, argparse
 import numpy as np
 import torch
